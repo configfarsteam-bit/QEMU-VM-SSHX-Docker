@@ -2,25 +2,33 @@
 set -Eeuo pipefail
 
 VM_DIR="${VM_DIR:-/var/lib/ubuntu-vm}"
-BASE_IMAGE="$VM_DIR/ubuntu-cloud.img"
+BASE_IMAGE="$VM_DIR/ubuntu-24.04-server-cloudimg-amd64.img"
 DISK_IMAGE="$VM_DIR/ubuntu.qcow2"
 SEED_IMAGE="$VM_DIR/seed.iso"
 SSH_KEY="$VM_DIR/id_ed25519"
-SSH_PORT=2222
 
+SSH_PORT="${SSH_PORT:-2222}"
 MEMORY="${MEMORY:-2048}"
 CPUS="${CPUS:-2}"
 
-mkdir -p "$VM_DIR"
-
 log() {
-    echo "[qemu.sh] $*"
+    printf '[qemu.sh] %s
+' "$*"
 }
 
-cleanup() {
-    log "Stopping virtual machine..."
+mkdir -p "$VM_DIR"
 
+# جلوگیری از اجرای هم‌زمان دو VM روی یک volume
+exec 9>"$VM_DIR/qemu.lock"
+
+if ! flock -n 9; then
+    log "Another instance is already using this VM volume"
+    exit 1
+fi
+
+cleanup() {
     if [[ -n "${QEMU_PID:-}" ]] && kill -0 "$QEMU_PID" 2>/dev/null; then
+        log "Stopping virtual machine..."
         kill "$QEMU_PID" 2>/dev/null || true
         wait "$QEMU_PID" 2>/dev/null || true
     fi
@@ -31,12 +39,12 @@ trap cleanup EXIT INT TERM
 # ساخت کلید SSH
 if [[ ! -f "$SSH_KEY" ]]; then
     log "Generating SSH key..."
-    ssh-keygen -t ed25519 -N "" -f "$SSH_KEY"
+    ssh-keygen -t ed25519 -N "" -f "$SSH_KEY" >/dev/null
 fi
 
-# دریافت جدیدترین Ubuntu 24.04 Cloud Image
-if [[ ! -f "$BASE_IMAGE" ]]; then
-    log "Downloading latest Ubuntu cloud image..."
+# دریافت آخرین Ubuntu 24.04 Cloud Image
+if [[ ! -s "$BASE_IMAGE" ]]; then
+    log "Downloading latest Ubuntu 24.04 cloud image..."
 
     wget -q --show-progress \
         -O "$BASE_IMAGE" \
@@ -52,10 +60,12 @@ if [[ ! -f "$DISK_IMAGE" ]]; then
         -F qcow2 \
         -b "$BASE_IMAGE" \
         "$DISK_IMAGE" \
-        20G
+        20G >/dev/null
 fi
 
-# تنظیمات cloud-init
+PUBKEY="$(cat "$SSH_KEY.pub")"
+
+# تنظیم cloud-init
 cat > "$VM_DIR/user-data" <<EOF
 #cloud-config
 
@@ -65,10 +75,11 @@ manage_etc_hosts: true
 users:
   - name: ubuntu
     shell: /bin/bash
-    groups: sudo
+    groups:
+      - sudo
     sudo: ALL=(ALL) NOPASSWD:ALL
     ssh_authorized_keys:
-      - $(cat "$SSH_KEY.pub")
+      - $PUBKEY
 
 ssh_pwauth: false
 package_update: true
@@ -77,12 +88,10 @@ packages:
   - openssh-server
   - curl
   - ca-certificates
-  - bash
 
 runcmd:
-  - systemctl enable ssh
-  - systemctl restart ssh
-  - touch /var/lib/cloud/instance/ssh-ready
+  - systemctl enable --now ssh
+  - touch /var/lib/cloud/instance/sshx-ready
 EOF
 
 cat > "$VM_DIR/meta-data" <<EOF
@@ -90,29 +99,35 @@ instance-id: ubuntu-sshx
 local-hostname: ubuntu-sshx
 EOF
 
+log "Creating cloud-init seed image..."
+
 cloud-localds \
     "$SEED_IMAGE" \
     "$VM_DIR/user-data" \
     "$VM_DIR/meta-data"
 
 # تشخیص KVM
-if [[ -e /dev/kvm && -r /dev/kvm && -w /dev/kvm ]]; then
-    log "KVM detected"
-    log "Using hardware virtualization"
+if [[ -r /dev/kvm && -w /dev/kvm ]]; then
+    log "KVM detected; using hardware acceleration"
 
     ACCEL_ARGS=(
         -enable-kvm
         -cpu host
     )
 else
-    log "KVM not detected"
-    log "Using QEMU software emulation"
+    log "KVM not detected; using QEMU software emulation"
 
     ACCEL_ARGS=(
-        -accel tcg
+        -accel tcg,thread=multi
         -cpu max
     )
 fi
+
+SERIAL_LOG="$VM_DIR/serial.log"
+QEMU_ERROR_LOG="$VM_DIR/qemu.stderr.log"
+
+: > "$SERIAL_LOG"
+: > "$QEMU_ERROR_LOG"
 
 log "Starting Ubuntu virtual machine..."
 
@@ -124,55 +139,80 @@ qemu-system-x86_64 \
     -name ubuntu-sshx \
     -drive "file=$DISK_IMAGE,if=virtio,format=qcow2" \
     -drive "file=$SEED_IMAGE,if=virtio,format=raw,readonly=on" \
-    -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22" \
-    -device virtio-net-pci,netdev=net0 \
+    -nic "user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22" \
     -display none \
-    -serial "$VM_DIR/serial.log" \
-    >/dev/null 2>&1 &
+    -serial "file:$SERIAL_LOG" \
+    -monitor none \
+    -no-reboot \
+    -no-shutdown \
+    >"$QEMU_ERROR_LOG" 2>&1 &
 
 QEMU_PID=$!
 
-log "Waiting for SSH inside Ubuntu..."
+sleep 2
 
-SSH_READY=false
+if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+    log "QEMU failed to start"
+    log "QEMU error log:"
+    cat "$QEMU_ERROR_LOG" 2>/dev/null || true
+    log "VM serial log:"
+    cat "$SERIAL_LOG" 2>/dev/null || true
+    exit 1
+fi
+
+log "Waiting for Ubuntu SSH on 127.0.0.1:$SSH_PORT..."
+
+READY=0
 
 for _ in {1..180}; do
     if ssh \
         -p "$SSH_PORT" \
         -i "$SSH_KEY" \
+        -o BatchMode=yes \
         -o StrictHostKeyChecking=no \
         -o UserKnownHostsFile=/dev/null \
         -o ConnectTimeout=3 \
         ubuntu@127.0.0.1 \
-        "test -f /var/lib/cloud/instance/ssh-ready" \
+        "test -f /var/lib/cloud/instance/sshx-ready" \
         >/dev/null 2>&1; then
 
-        SSH_READY=true
+        READY=1
         break
     fi
 
     if ! kill -0 "$QEMU_PID" 2>/dev/null; then
         log "QEMU stopped unexpectedly"
-        cat "$VM_DIR/serial.log" || true
+
+        log "QEMU error log:"
+        cat "$QEMU_ERROR_LOG" 2>/dev/null || true
+
+        log "VM serial log:"
+        cat "$SERIAL_LOG" 2>/dev/null || true
+
         exit 1
     fi
 
     sleep 2
 done
 
-if [[ "$SSH_READY" != "true" ]]; then
-    log "Ubuntu did not become ready in time"
+if (( READY != 1 )); then
+    log "Ubuntu did not become ready within 6 minutes"
     exit 1
 fi
 
 log "Ubuntu is ready"
-log "Installing sshx inside the virtual machine..."
+log "Starting sshx inside the virtual machine"
 
-echo
-echo "============================================================"
-echo "                 SSHX STARTING"
-echo "============================================================"
-echo
+printf '
+'
+printf '%s
+' '============================================================'
+printf '%s
+' '                 SSHX LINK, COPY THIS URL'
+printf '%s
+' '============================================================'
+printf '
+'
 
 ssh -tt \
     -p "$SSH_PORT" \
@@ -180,24 +220,14 @@ ssh -tt \
     -o StrictHostKeyChecking=no \
     -o UserKnownHostsFile=/dev/null \
     ubuntu@127.0.0.1 \
-    'bash -lc "
-        export PATH=\$HOME/.local/bin:\$HOME/bin:\$PATH
+    'bash -lc '\''
+        export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
 
         if ! command -v sshx >/dev/null 2>&1; then
             curl -sSf https://sshx.io/get | sh
         fi
 
-        export PATH=\$HOME/.local/bin:\$HOME/bin:\$PATH
+        export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
 
-        echo
-        echo \"============================================================\"
-        echo \"                    SSHX LINK\"
-        echo \"============================================================\"
-
-        sshx
-
-        echo
-        echo \"============================================================\"
-        echo \"                    SSHX STOPPED\"
-        echo \"============================================================\"
-    "'
+        exec sshx
+    '\'''
