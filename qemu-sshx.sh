@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 VM_DIR="${VM_DIR:-/state/ubuntu-vm}"
 # Guest RAM is intentionally fixed: exactly 256 MiB per VM. Not configurable.
-readonly MEMORY_MIB=512
+readonly MEMORY_MIB=256
 DISK_SIZE="${DISK_SIZE:-20G}"
 GUEST_SWAP_MB="${GUEST_SWAP_MB:-1024}"        # swap file INSIDE the guest (disk, not RAM)
 TCG_TB_SIZE_MB="${TCG_TB_SIZE_MB:-32}"        # TCG code cache in host RAM (QEMU default is 1 GiB)
