@@ -8,7 +8,7 @@
 set -Eeuo pipefail
 
 VM_DIR="${VM_DIR:-/state/ubuntu-vm}"
-MEMORY_MIB="${MEMORY_MIB:-256}"               # guest RAM in MiB (container needs ~2x this)
+MEMORY_MIB="${MEMORY_MIB:-512}"               # guest RAM in MiB (container needs ~2x this)
 DISK_SIZE="${DISK_SIZE:-20G}"
 GUEST_SWAP_MB="${GUEST_SWAP_MB:-1024}"        # swap file INSIDE the guest (disk, not RAM)
 TCG_TB_SIZE_MB="${TCG_TB_SIZE_MB:-64}"        # TCG code cache in host RAM (QEMU default is 1 GiB)
