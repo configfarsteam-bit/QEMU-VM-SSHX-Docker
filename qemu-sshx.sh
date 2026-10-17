@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Ubuntu VM (QEMU, KVM if available, otherwise TCG) -> sshx -> link in docker logs
+# Tuned for a 512 MiB container without KVM.
 #
 # Sleep/restart survival: while the VM runs, a live snapshot (RAM + disk state) is saved
 # into /state every SNAPSHOT_INTERVAL_MIN minutes. If the container is stopped (e.g. the
@@ -8,21 +9,27 @@
 set -Eeuo pipefail
 
 VM_DIR="${VM_DIR:-/state/ubuntu-vm}"
-MEMORY_MIB="${MEMORY_MIB:-256}"               # guest RAM in MiB (container needs ~2x this)
+MEMORY_MIB="${MEMORY_MIB:-256}"               # guest RAM in MiB
 DISK_SIZE="${DISK_SIZE:-20G}"
 GUEST_SWAP_MB="${GUEST_SWAP_MB:-1024}"        # swap file INSIDE the guest (disk, not RAM)
-TCG_TB_SIZE_MB="${TCG_TB_SIZE_MB:-64}"        # TCG code cache in host RAM (QEMU default is 1 GiB)
+TCG_TB_SIZE_MB="${TCG_TB_SIZE_MB:-80}"        # TCG code cache in host RAM (QEMU default is 1 GiB)
+HOST_RESERVE_MIB="${HOST_RESERVE_MIB:-96}"    # QEMU own overhead + shell/python helpers + page cache
+CPU_MODEL="${CPU_MODEL:-qemu64}"              # TCG CPU model; qemu64 is much cheaper to emulate than "max"
+MACHINE="${MACHINE:-pc,hpet=off}"             # i440fx is lighter than q35; no HPET = fewer timer exits
+DISK_CACHE="${DISK_CACHE:-unsafe}"            # unsafe = fastest; use "none" if the container still gets OOM-killed
 BOOT_TIMEOUT_MIN="${BOOT_TIMEOUT_MIN:-90}"    # TCG is slow, so be generous
 GUEST_UNIT_TIMEOUT_SEC="${GUEST_UNIT_TIMEOUT_SEC:-900}"  # systemd device/start timeouts in guest (default 90s is too short under TCG)
 DIRECT_KERNEL="${DIRECT_KERNEL:-1}"           # 1 = boot kernel/initrd directly (needed to pass boot options)
 GUEST_APPARMOR="${GUEST_APPARMOR:-0}"         # 0 = boot guest with apparmor=0 (much faster under TCG)
+FULL_VM="${FULL_VM:-1}"                       # 1 = behave like a normal full Ubuntu: no masked services, AppArmor on, full boot messages (slower, more RAM)
 SHOW_BOOT_LOG="${SHOW_BOOT_LOG:-1}"           # 1 = stream VM console to docker logs
 RESUME="${RESUME:-1}"                         # 1 = restore the VM from the last snapshot if one exists
-SNAPSHOT_INTERVAL_MIN="${SNAPSHOT_INTERVAL_MIN:-10}"     # 0 = never snapshot (no resume possible)
-SNAPSHOT_FIRST_DELAY_SEC="${SNAPSHOT_FIRST_DELAY_SEC:-120}"  # first snapshot this long after the sshx link appears
+SNAPSHOT_INTERVAL_MIN="${SNAPSHOT_INTERVAL_MIN:-20}"     # 0 = never snapshot (no resume possible); the VM is paused during each snapshot
+SNAPSHOT_FIRST_DELAY_SEC="${SNAPSHOT_FIRST_DELAY_SEC:-300}"  # first snapshot this long after the sshx link appears
 SNAPSHOT_TIMEOUT_SEC="${SNAPSHOT_TIMEOUT_SEC:-600}"      # give up on one periodic snapshot after this long
-SNAPSHOT_STOP_TIMEOUT_SEC="${SNAPSHOT_STOP_TIMEOUT_SEC:-20}"  # best-effort snapshot on docker stop (0 = skip)
+SNAPSHOT_STOP_TIMEOUT_SEC="${SNAPSHOT_STOP_TIMEOUT_SEC:-20}"  # best-effort snapshot on docker stop (0 = skip); raise it together with "docker stop -t"
 RESUME_TIMEOUT_SEC="${RESUME_TIMEOUT_SEC:-180}"          # max wait for a restored VM to start running
+SSHX_REDIRECT="${SSHX_REDIRECT:-/usr/local/bin/sshx-redirect.py}"  # tiny HTTP server that redirects to the sshx link
 IMAGE_BASE_URL="${IMAGE_BASE_URL:-https://cloud-images.ubuntu.com/noble/current}"
 IMAGE_NAME="noble-server-cloudimg-amd64"
 IMAGE_URL="${IMAGE_URL:-$IMAGE_BASE_URL/$IMAGE_NAME.img}"
@@ -38,6 +45,8 @@ SERIAL_LOG="$VM_DIR/serial.log"
 SSHX_URL_FILE="$VM_DIR/sshx-url"
 SNAP_FILE="$VM_DIR/snapshot-tag"
 MON_SOCK="$VM_DIR/monitor.sock"
+LOCK_DIR="$VM_DIR/.lock"
+LOCK_HELD=0
 WEB_PID=""
 WEB_PORT="${PORT:-8080}"
 
@@ -48,13 +57,16 @@ die() { log "ERROR: $*"; exit 1; }
 for v in GUEST_SWAP_MB SNAPSHOT_INTERVAL_MIN SNAPSHOT_STOP_TIMEOUT_SEC; do
   [[ "${!v}" =~ ^[0-9]+$ ]] || die "$v must be a non-negative integer"
 done
-for v in MEMORY_MIB TCG_TB_SIZE_MB BOOT_TIMEOUT_MIN GUEST_UNIT_TIMEOUT_SEC \
+for v in MEMORY_MIB TCG_TB_SIZE_MB HOST_RESERVE_MIB BOOT_TIMEOUT_MIN GUEST_UNIT_TIMEOUT_SEC \
          SNAPSHOT_FIRST_DELAY_SEC SNAPSHOT_TIMEOUT_SEC RESUME_TIMEOUT_SEC; do
   [[ "${!v}" =~ ^[1-9][0-9]*$ ]] || die "$v must be a positive integer"
 done
-for v in DIRECT_KERNEL GUEST_APPARMOR SHOW_BOOT_LOG RESUME; do
+for v in DIRECT_KERNEL GUEST_APPARMOR SHOW_BOOT_LOG RESUME FULL_VM; do
   [[ "${!v}" == 0 || "${!v}" == 1 ]] || die "$v must be 0 or 1"
 done
+[[ "$DISK_CACHE" =~ ^(unsafe|writeback|none|writethrough)$ ]] || die "DISK_CACHE must be unsafe, writeback, none or writethrough"
+[[ "$CPU_MODEL" =~ ^[A-Za-z0-9_.,+-]+$ ]] || die "CPU_MODEL contains invalid characters"
+[[ "$MACHINE" =~ ^[A-Za-z0-9_.,=-]+$ ]] || die "MACHINE contains invalid characters"
 
 # CPUs: default = what the container may actually use (cgroup cpu.max), max 2.
 # More vCPUs than real cores only makes TCG slower.
@@ -77,6 +89,7 @@ CPUS="${CPUS:-$(detect_cpus)}"
 for bin in wget sha256sum qemu-img cloud-localds qemu-system-x86_64 python3 pkill; do
   command -v "$bin" >/dev/null 2>&1 || die "required tool not found: $bin"
 done
+[[ -r "$SSHX_REDIRECT" ]] || die "HTTP redirect helper not found: $SSHX_REDIRECT"
 
 mkdir -p "$VM_DIR"
 [[ -w "$VM_DIR" ]] || die "VM_DIR is not writable: $VM_DIR"
@@ -146,6 +159,7 @@ take_snapshot() {
   local timeout=$1 mode=${2:-} tag old="" out
   tag="s$(date +%s)"
   [[ -s "$SNAP_FILE" ]] && old=$(head -n1 "$SNAP_FILE")
+  [[ "$tag" == "$old" ]] && tag="${tag}b"   # two snapshots within the same second
   out=$(mon "$timeout" "savevm $tag") || { log "snapshot: monitor error or timeout"; return 1; }
   if grep -qi 'error' <<<"$out"; then log "snapshot failed: $out"; return 1; fi
   out=$(mon 30 "info snapshots") || { log "snapshot: could not verify"; return 1; }
@@ -198,24 +212,18 @@ cleanup() {
     kill "$QEMU_PID" 2>/dev/null || true
     wait "$QEMU_PID" 2>/dev/null || true
   fi
-  rm -f "$MON_SOCK" 2>/dev/null || true
-  rm -f "${LOCK_DIR:-}/pid" 2>/dev/null || true
-  rmdir "${LOCK_DIR:-}" 2>/dev/null || true
+  # Only touch shared state (monitor socket, lock) if this process owns the lock;
+  # an instance that died on "another VM is already using ..." must not break the running one.
+  if (( LOCK_HELD == 1 )); then
+    rm -f "$MON_SOCK" 2>/dev/null || true
+    rm -f "$LOCK_DIR/pid" 2>/dev/null || true
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
-# Keep the old sshx link only if there is a snapshot that can bring that session back.
-if [[ "$RESUME" != 1 || ! -s "$SNAP_FILE" ]]; then
-  rm -f "$SSHX_URL_FILE" "$SSHX_URL_FILE.part"
-fi
-python3 /usr/local/bin/sshx-redirect.py --host 0.0.0.0 --port "$WEB_PORT" --url-file "$SSHX_URL_FILE" &
-WEB_PID=$!
-sleep 0.1
-kill -0 "$WEB_PID" 2>/dev/null || die "HTTP redirect server failed to start on port $WEB_PORT"
-log "HTTP redirect server listening on 0.0.0.0:$WEB_PORT"
-
-LOCK_DIR="$VM_DIR/.lock"
+# ---- single-instance lock (taken before touching any shared state) ------------
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   # A lock left by a killed container is stale. In a fresh container this script is often
   # PID 1 again, so a lock holding our own PID is stale too.
@@ -229,15 +237,29 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
     die "another VM is already using $VM_DIR"
   fi
 fi
+LOCK_HELD=1
 printf '%s\n' "$$" > "$LOCK_DIR/pid"
 
+# Keep the old sshx link only if there is a snapshot that can bring that session back.
+if [[ "$RESUME" != 1 || ! -s "$SNAP_FILE" ]]; then
+  rm -f "$SSHX_URL_FILE" "$SSHX_URL_FILE.part"
+fi
+python3 "$SSHX_REDIRECT" --host 0.0.0.0 --port "$WEB_PORT" --url-file "$SSHX_URL_FILE" &
+WEB_PID=$!
+sleep 0.1
+kill -0 "$WEB_PID" 2>/dev/null || die "HTTP redirect server failed to start on port $WEB_PORT"
+log "HTTP redirect server listening on 0.0.0.0:$WEB_PORT"
+
+# Memory budget: guest RAM + TCG code cache + host overhead must fit in the container.
+NEED_MIB=$(( MEMORY_MIB + TCG_TB_SIZE_MB + HOST_RESERVE_MIB ))
 if [[ -r /sys/fs/cgroup/memory.max ]]; then
   MEMORY_LIMIT=$(cat /sys/fs/cgroup/memory.max)
-  MIN_LIMIT=$(( MEMORY_MIB * 2 * 1024 * 1024 ))
-  log "Container memory limit: $MEMORY_LIMIT (needs ~$((MEMORY_MIB * 2))MiB+ for ${MEMORY_MIB}M guest + QEMU)"
-  if [[ "$MEMORY_LIMIT" =~ ^[0-9]+$ ]] && (( MEMORY_LIMIT < MIN_LIMIT )); then
-    die "container memory limit is below $((MEMORY_MIB * 2))MiB; lower MEMORY_MIB or raise the limit"
+  log "Container memory limit: $MEMORY_LIMIT; budget: guest ${MEMORY_MIB} + TCG cache ${TCG_TB_SIZE_MB} + host ${HOST_RESERVE_MIB} = ${NEED_MIB} MiB"
+  if [[ "$MEMORY_LIMIT" =~ ^[0-9]+$ ]] && (( MEMORY_LIMIT < NEED_MIB * 1024 * 1024 )); then
+    die "container memory limit is below ${NEED_MIB}MiB; lower MEMORY_MIB / TCG_TB_SIZE_MB or raise the limit"
   fi
+else
+  log "Memory budget: guest ${MEMORY_MIB} + TCG cache ${TCG_TB_SIZE_MB} + host ${HOST_RESERVE_MIB} = ${NEED_MIB} MiB"
 fi
 
 # ---- downloads ---------------------------------------------------------------
@@ -255,21 +277,21 @@ fetch() {
   wget -q --show-progress --progress=dot:giga --tries=3 --timeout=30 -O "$dest.part" "$url" || { rm -f "$dest.part"; return 1; }
   sums=$(wget -qO- --tries=3 --timeout=30 "${url%/*}/SHA256SUMS" 2>/dev/null | awk -v n="$name" '{gsub(/^\*/, "", $NF); if ($NF == n) {print $1; exit}}' || true)
   [[ "$sums" =~ ^[0-9a-fA-F]{64}$ ]] || { rm -f "$dest.part"; log "no valid SHA256 entry for $name"; return 1; }
-  if [[ -n "$sums" ]]; then
-    if [[ "$(sha256sum "$dest.part" | awk '{print $1}')" != "$sums" ]]; then
-      rm -f "$dest.part"; log "checksum mismatch for $name"; return 1
-    fi
-    log "$name checksum OK"
-  else
-    log "WARNING: no checksum available for $name, skipping verification"
+  if [[ "$(sha256sum "$dest.part" | awk '{print $1}')" != "$sums" ]]; then
+    rm -f "$dest.part"; log "checksum mismatch for $name"; return 1
   fi
+  log "$name checksum OK"
   mv "$dest.part" "$dest"
 }
 
 if [[ "$DIRECT_KERNEL" == 1 && -s "$BASE_IMAGE" && ! ( -s "$KERNEL" && -s "$INITRD" ) ]]; then
-  # kernel/initrd must come from the same build as base.img -> refresh all three
+  # kernel/initrd must come from the same build as base.img -> all three have to be refreshed together.
+  # That needs a new overlay disk, so never do it silently when a disk with data already exists.
+  if [[ -e "$DISK_IMAGE" ]]; then
+    die "kernel/initrd are missing but $DISK_IMAGE already exists; refusing to delete your VM disk. Either set DIRECT_KERNEL=0, or back up and remove $BASE_IMAGE and $DISK_IMAGE yourself to start fresh"
+  fi
   log "Kernel/initrd missing for existing image -> re-downloading matching set"
-  rm -f "$BASE_IMAGE" "$DISK_IMAGE"
+  rm -f "$BASE_IMAGE"
 fi
 if [[ ! -s "$BASE_IMAGE" ]]; then
   fetch "$IMAGE_URL" "$BASE_IMAGE" || die "image download failed"
@@ -313,11 +335,9 @@ cloud_config_modules:
   - runcmd
 cloud_final_modules:
   - scripts-user
-package_upgrade: false
-package_reboot_if_required: false
 bootcmd:
   - [sh, -c, 'command -v growpart >/dev/null 2>&1 && growpart /dev/vda 1 >/dev/null 2>&1 || true; command -v resize2fs >/dev/null 2>&1 && resize2fs /dev/vda1 >/dev/null 2>&1 || true; S=${GUEST_SWAP_MB}; if [ "\$S" -gt 0 ] && ! swapon --show=NAME --noheadings | grep -q /swapfile; then [ -f /swapfile ] || { fallocate -l \${S}M /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=\$S; chmod 600 /swapfile; mkswap /swapfile; }; swapon /swapfile; fi; sysctl -w vm.swappiness=60 >/dev/null; true']
-  - [sh, -c, 'for u in snapd.service snapd.socket snapd.seeded.service snapd.apparmor.service unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service motd-news.timer motd-news.service man-db.timer fwupd-refresh.timer packagekit.service ModemManager.service udisks2.service multipathd.service multipathd.socket fwupd.service; do systemctl --no-block stop "\$u" 2>/dev/null; systemctl mask "\$u" 2>/dev/null; done; true']
+  - [sh, -c, 'for u in snapd.service snapd.socket snapd.seeded.service snapd.apparmor.service unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service motd-news.timer motd-news.service man-db.timer fwupd-refresh.timer packagekit.service ModemManager.service udisks2.service multipathd.service multipathd.socket fwupd.service fstrim.timer e2scrub_all.timer e2scrub_reap.service ua-timer.timer ubuntu-advantage.service pollinate.service lxd-installer.socket apport.service; do systemctl --no-block stop "\$u" 2>/dev/null; systemctl mask "\$u" 2>/dev/null; done; true']
   - [sh, -c, 'rm -f /etc/apt/apt.conf.d/50appstream /etc/apt/apt.conf.d/99update-notifier; chmod -x /etc/update-motd.d/50-motd-news /etc/update-motd.d/90-updates-available /etc/update-motd.d/91-release-upgrade 2>/dev/null; true']
   - [sh, -c, 'mkdir -p /etc/systemd/system.conf.d; printf "[Manager]\nDefaultTimeoutStartSec=${GUEST_UNIT_TIMEOUT_SEC}s\nDefaultDeviceTimeoutSec=${GUEST_UNIT_TIMEOUT_SEC}s\n" > /etc/systemd/system.conf.d/90-slow-tcg.conf; sed -i -E "/LABEL=(BOOT|UEFI)[[:space:]]/{/nofail/!s/^([^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+)([^[:space:]]+)/\1\2,nofail,x-systemd.device-timeout=${GUEST_UNIT_TIMEOUT_SEC}s/}" /etc/fstab; true']
 write_files:
@@ -373,6 +393,12 @@ runcmd:
 CLOUD
 # new instance-id every cold start => cloud-init always re-applies the config
 printf 'instance-id: sshx-%s-%s\nlocal-hostname: ubuntu-sshx\n' "$(date +%s)" "$$" > "$VM_DIR/meta-data"
+if [[ "$FULL_VM" == 1 ]]; then
+  # keep every stock service/timer/MOTD hook: drop the "mask heavy services" and apt/motd tweak lines
+  sed -i -e '/systemctl mask/d' -e '/50appstream/d' "$VM_DIR/user-data"
+  # ...and keep cloud-init's stock module lists too (hostname, users, ssh host keys, seed_random, ...)
+  sed -i '/^cloud_init_modules:/,/^  - scripts-user$/d' "$VM_DIR/user-data"
+fi
 cloud-localds "$SEED_IMAGE" "$VM_DIR/user-data" "$VM_DIR/meta-data"
 }
 
@@ -381,8 +407,10 @@ if [[ -r /dev/kvm && -w /dev/kvm ]]; then
   log "KVM detected -> hardware acceleration"
   ACCEL=(-accel kvm -cpu host)
 else
-  log "KVM not available -> TCG software emulation (slow, can take 10-40 min)"
-  ACCEL=(-accel "tcg,thread=multi,tb-size=${TCG_TB_SIZE_MB}" -cpu max)
+  # Multi-threaded TCG only helps with 2 vCPUs; with 1 vCPU single-thread TCG has less overhead.
+  if (( CPUS > 1 )); then TCG_THREAD=multi; else TCG_THREAD=single; fi
+  log "KVM not available -> TCG software emulation (slow, can take 10-40 min); cpu=$CPU_MODEL thread=$TCG_THREAD tb=${TCG_TB_SIZE_MB}M"
+  ACCEL=(-accel "tcg,thread=${TCG_THREAD},tb-size=${TCG_TB_SIZE_MB}" -cpu "$CPU_MODEL")
 fi
 
 # ---- boot options (direct kernel boot only) ----------------------------------
@@ -391,13 +419,22 @@ if [[ "$DIRECT_KERNEL" == 1 ]]; then
   T=$GUEST_UNIT_TIMEOUT_SEC
   CMDLINE="root=LABEL=cloudimg-rootfs ro console=ttyS0,115200n8 ds=nocloud"
   CMDLINE+=" systemd.default_device_timeout_sec=$T systemd.default_timeout_start_sec=$T"
-  for u in snapd.service snapd.socket snapd.seeded.service snapd.apparmor.service \
-           unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer \
-           motd-news.timer man-db.timer fwupd-refresh.timer ModemManager.service \
-           multipathd.service multipathd.socket udisks2.service packagekit.service; do
-    CMDLINE+=" systemd.mask=$u"
-  done
-  [[ "$GUEST_APPARMOR" == 0 ]] && CMDLINE+=" apparmor=0"
+  if [[ "$FULL_VM" == 1 ]]; then
+    # Normal Ubuntu behaviour: all services enabled, AppArmor on, normal boot messages.
+    CMDLINE+=" loglevel=4 nokaslr"
+  else
+    # loglevel=4 keeps the kernel "Out of memory" messages visible (they are level 3)
+    CMDLINE+=" quiet loglevel=4 systemd.show_status=0 mitigations=off nokaslr audit=0"
+    for u in snapd.service snapd.socket snapd.seeded.service snapd.apparmor.service \
+             unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer \
+             motd-news.timer man-db.timer fwupd-refresh.timer ModemManager.service \
+             multipathd.service multipathd.socket udisks2.service packagekit.service \
+             fstrim.timer e2scrub_all.timer e2scrub_reap.service ua-timer.timer \
+             ubuntu-advantage.service pollinate.service lxd-installer.socket apport.service; do
+      CMDLINE+=" systemd.mask=$u"
+    done
+    if [[ "$GUEST_APPARMOR" == 0 ]]; then CMDLINE+=" apparmor=0"; fi
+  fi
   BOOT=(-kernel "$KERNEL" -initrd "$INITRD" -append "$CMDLINE")
   log "Direct kernel boot: $CMDLINE"
 else
@@ -406,14 +443,15 @@ fi
 
 # launch_qemu [SNAPSHOT_TAG]  -> starts QEMU in the background and sets QEMU_PID.
 # The machine definition must stay identical between runs, otherwise a snapshot cannot be loaded.
+# MALLOC_ARENA_MAX=1 keeps glibc from creating per-thread arenas (saves tens of MiB with TCG threads).
 launch_qemu() {
   local extra=()
   [[ -n "${1:-}" ]] && extra=(-loadvm "$1")
   rm -f "$MON_SOCK"
-  qemu-system-x86_64 "${ACCEL[@]}" \
-    -machine q35 -m "${MEMORY_MIB}M" -smp "$CPUS" \
+  MALLOC_ARENA_MAX=1 qemu-system-x86_64 "${ACCEL[@]}" \
+    -machine "$MACHINE" -m "${MEMORY_MIB}M" -smp "$CPUS" \
     "${BOOT[@]}" "${extra[@]}" \
-    -drive "file=$DISK_IMAGE,if=virtio,format=qcow2,cache=unsafe,aio=threads" \
+    -drive "file=$DISK_IMAGE,if=virtio,format=qcow2,cache=${DISK_CACHE},aio=threads" \
     -drive "file=$SEED_IMAGE,if=virtio,format=raw,readonly=on" \
     -nic user,model=virtio-net-pci \
     -device virtio-rng-pci \
@@ -439,7 +477,7 @@ if [[ -n "$RESUME_TAG" ]]; then
     RESUMED=1
     log "VM resumed from snapshot"
   else
-    log "WARNING: resume failed -> falling back to a cold boot (disk data is kept)"
+    log "WARNING: resume failed (e.g. machine/CPU settings changed since the snapshot) -> falling back to a cold boot (disk data is kept)"
     kill "$QEMU_PID" 2>/dev/null || true
     wait "$QEMU_PID" 2>/dev/null || true
     QEMU_PID=""
