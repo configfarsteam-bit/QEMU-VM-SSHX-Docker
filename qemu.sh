@@ -54,6 +54,7 @@ CF_WAIT_SEC="${CF_WAIT_SEC:-60}"              # how long to wait for the first t
 MEMORY_MIB="${MEMORY_MIB:-auto}"              # guest RAM in MiB
 CPUS="${CPUS:-auto}"                          # guest vCPUs
 DISK_SIZE="${DISK_SIZE:-auto}"                # guest disk (virtual size)
+DISK_MAX_GIB="${DISK_MAX_GIB:-256}"           # upper limit for the auto disk size: some volumes report absurd free space (exabytes) and qcow2/ext4 cannot use that
 GUEST_SWAP_MB="${GUEST_SWAP_MB:-auto}"        # swap file INSIDE the guest (disk, not RAM); auto = min(1024, disk/8)
 TCG_TB_SIZE_MB="${TCG_TB_SIZE_MB:-auto}"      # TCG code cache in host RAM; auto = 12% of the container RAM (48..256)
 HOST_RESERVE_MIB="${HOST_RESERVE_MIB:-auto}"  # QEMU overhead + ttyd + cloudflared + ssh/python helpers + page cache; auto = 20% (160..1024)
@@ -92,7 +93,7 @@ for v in SNAPSHOT_INTERVAL_MIN SNAPSHOT_STOP_TIMEOUT_SEC; do
   [[ "${!v}" =~ ^(0|[1-9][0-9]*)$ ]] || die "$v must be a non-negative integer (no leading zeros)"
 done
 [[ "$GUEST_SWAP_MB" == auto || "$GUEST_SWAP_MB" =~ ^(0|[1-9][0-9]*)$ ]] || die "GUEST_SWAP_MB must be 'auto' or a non-negative integer"
-for v in BOOT_TIMEOUT_MIN GUEST_UNIT_TIMEOUT_SEC SNAPSHOT_FIRST_DELAY_SEC SNAPSHOT_TIMEOUT_SEC \
+for v in DISK_MAX_GIB BOOT_TIMEOUT_MIN GUEST_UNIT_TIMEOUT_SEC SNAPSHOT_FIRST_DELAY_SEC SNAPSHOT_TIMEOUT_SEC \
          RESUME_TIMEOUT_SEC WEB_MAX_CLIENTS CF_WAIT_SEC; do
   [[ "${!v}" =~ ^[1-9][0-9]*$ ]] || die "$v must be a positive integer"
 done
@@ -520,7 +521,8 @@ print_link_banner() {
 # ttyd_loop: keep ttyd running (restart on crash)
 ttyd_loop() {
   local pid help args
-  args=(-p "$WEB_PORT" -i "$WEB_BIND" -c "${WEB_USER}:${WEB_PASS}" -m "$WEB_MAX_CLIENTS" -t "titleFixed=Ubuntu VM")
+  # -d 3 = errors + warnings only: at the default level ttyd prints the base64 of user:password into the logs
+  args=(-p "$WEB_PORT" -i "$WEB_BIND" -c "${WEB_USER}:${WEB_PASS}" -m "$WEB_MAX_CLIENTS" -d 3 -t "titleFixed=Ubuntu VM")
   # ttyd >= 1.7 is read-only unless -W is given; 1.6 does not know -W (it is writable by default)
   help=$("$TTYD_BIN" --help 2>&1 || true)
   if [[ "$help" == *--writable* ]]; then args+=(-W); fi
@@ -634,8 +636,12 @@ if [[ ! -s "$DISK_IMAGE" ]]; then
     margin=$(( avail / 20 )); if (( margin < 256 )); then margin=256; fi
     disk_mib=$(( avail - snap_mib - margin ))
     (( disk_mib >= 4096 )) || die "only ${avail} MiB free in $VM_DIR; at least $(( 4096 + snap_mib + margin )) MiB are needed. Free some space or set DISK_SIZE"
+    if (( disk_mib > DISK_MAX_GIB * 1024 )); then
+      log "Free space (${avail} MiB) is larger than DISK_MAX_GIB=${DISK_MAX_GIB} -> limiting the VM disk to ${DISK_MAX_GIB} GiB"
+      disk_mib=$(( DISK_MAX_GIB * 1024 ))
+    fi
     DISK_SIZE="${disk_mib}M"
-    log "Disk: ${avail} MiB free -> VM disk ${disk_mib} MiB (reserved: snapshots ${snap_mib} MiB + margin ${margin} MiB)"
+    log "Disk: VM disk ${disk_mib} MiB (free space ${avail} MiB, reserved: snapshots ${snap_mib} MiB + margin ${margin} MiB)"
   fi
   log "Creating VM disk ($DISK_SIZE)..."
   rm -f "$DISK_IMAGE.part"
